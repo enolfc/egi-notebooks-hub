@@ -7,10 +7,10 @@ Uses OpenID Connect with aai.egi.eu
 import json
 import os
 import time
+from urllib.parse import urlencode
 
 from oauthenticator.generic import GenericOAuthenticator
 from tornado.httpclient import AsyncHTTPClient, HTTPClientError, HTTPRequest
-from tornado.httputil import url_concat
 from traitlets import List, Unicode, default, validate
 
 
@@ -29,15 +29,24 @@ class EGICheckinAuthenticator(GenericOAuthenticator):
 
     @default("authorize_url")
     def _authorize_url_default(self):
-        return "https://%s/oidc/authorize" % self.checkin_host
+        return (
+            "https://%s/auth/realms/egi/protocol/openid-connect/auth"
+            % self.checkin_host
+        )
 
     @default("token_url")
     def _token_url_default(self):
-        return "https://%s/oidc/token" % self.checkin_host
+        return (
+            "https://%s/auth/realms/egi/protocol/openid-connect/token"
+            % self.checkin_host
+        )
 
     @default("userdata_url")
     def _userdata_url_default(self):
-        return "https://%s/oidc/userinfo" % self.checkin_host
+        return (
+            "https://%s/auth/realms/egi/protocol/openid-connect/userinfo"
+            % self.checkin_host
+        )
 
     client_id_env = "EGICHECKIN_CLIENT_ID"
     client_secret_env = "EGICHECKIN_CLIENT_SECRET"
@@ -80,6 +89,34 @@ class EGICheckinAuthenticator(GenericOAuthenticator):
         """,
     )
 
+    async def authenticate(self, handler, data=None):
+        user_info = await super().authenticate(handler, data)
+        if user_info is None or self.claim_groups_key is None:
+            return user_info
+        auth_state = user_info.get("auth_state", {})
+        oauth_user = auth_state.get("oauth_user", {})
+        if not oauth_user:
+            self.log.warning("Missing OAuth info")
+            return user_info
+
+        # get groups by "claim_group_key"
+        groups = []
+        if callable(self.claim_groups_key):
+            groups = self.claim_groups_key(oauth_user)
+        else:
+            groups = oauth_user.get(self.claim_groups_key, [])
+        self.log.info("Groups: %s", groups)
+        auth_state["groups"] = groups
+
+        # first group as the primary, priority is governed by ordering in
+        # Authenticator.allowed_groups
+        first_group = next((v for v in self.allowed_groups if v in groups), None)
+        self.log.info("Primary group: %s", first_group)
+        if first_group:
+            auth_state["primary_group"] = first_group
+
+        return user_info
+
     # Refresh auth data for user
     async def refresh_user(self, user, handler=None):
         auth_state = await user.get_auth_state()
@@ -102,21 +139,22 @@ class EGICheckinAuthenticator(GenericOAuthenticator):
             "Accept": "application/json",
             "User-Agent": "JupyterHub",
         }
-        params = dict(
-            client_id=self.client_id,
-            client_secret=self.client_secret,
-            grant_type="refresh_token",
-            refresh_token=auth_state["refresh_token"],
-            scope=" ".join(self.scope),
+        body = urlencode(
+            dict(
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                grant_type="refresh_token",
+                refresh_token=auth_state["refresh_token"],
+                scope=" ".join(self.scope),
+            )
         )
-        url = url_concat(self.token_url, params)
         req = HTTPRequest(
-            url,
+            self.token_url,
             auth_username=self.client_id,
             auth_password=self.client_secret,
             headers=headers,
             method="POST",
-            body="",
+            body=body,
         )
         try:
             resp = await http_client.fetch(req)
@@ -127,15 +165,9 @@ class EGICheckinAuthenticator(GenericOAuthenticator):
         refresh_info["expiry_time"] = now + refresh_info["expires_in"]
         auth_state["refresh_info"] = refresh_info
         auth_state["access_token"] = refresh_info["access_token"]
-        auth_state["refresh_token"] = refresh_info["refresh_token"]
+        if "refresh_token" in refresh_info:
+            auth_state["refresh_token"] = refresh_info["refresh_token"]
+        if "id_token" in refresh_info:
+            auth_state["id_token"] = refresh_info["id_token"]
         self.log.debug("Refreshed token for user!")
-        if callable(getattr(user.spawner, "set_access_token", None)):
-            user.spawner.set_access_token(
-                auth_state["access_token"], refresh_info.get("id_token", None)
-            )
         return {"auth_state": auth_state}
-
-    async def pre_spawn_start(self, user, spawner):
-        auth_state = await user.get_auth_state()
-        if auth_state and callable(getattr(user.spawner, "set_access_token", None)):
-            user.spawner.set_access_token(auth_state["access_token"])
