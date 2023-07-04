@@ -2,41 +2,23 @@
 """
 
 import base64
-import datetime
 import json
 import os
-from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlparse, urlunparse
-from xml.etree import ElementTree
+from urllib.parse import quote_plus, unquote, urlencode
 
 import jwt
 import xmltodict
-from jupyterhub.auth import Authenticator
-from jupyterhub.handlers import BaseHandler
 from jupyterhub.utils import url_path_join
 from kubespawner import KubeSpawner
 from oauthenticator.generic import GenericOAuthenticator
 from oauthenticator.oauth2 import OAuthLoginHandler
 from tornado import web
 from tornado.httpclient import AsyncHTTPClient, HTTPError, HTTPRequest
-from tornado.httputil import url_concat
 from traitlets import Dict, List, Unicode
 
-D4SCIENCE_SOCIAL_URL = os.environ.get(
-    "D4SCIENCE_SOCIAL_URL",
-    "https://api.d4science.org/social-networking-library-ws/rest/",
-)
-D4SCIENCE_PROFILE = "2/people/profile"
 D4SCIENCE_REGISTRY_BASE_URL = os.environ.get(
     "D4SCIENCE_REGISTRY_BASE_URL",
     "https://registry.d4science.org/icproxy/gcube/service",
-)
-D4SCIENCE_DM_REGISTRY_URL = os.environ.get(
-    "D4SCIENCE_REGISTRY_URL",
-    D4SCIENCE_REGISTRY_BASE_URL + "/ServiceEndpoint/DataAnalysis/DataMiner",
-)
-D4SCIENCE_DISCOVER_WPS = os.environ.get(
-    "D4SCIENCE_DISCOVER_WPS",
-    "false",
 )
 D4SCIENCE_OIDC_URL = os.environ.get(
     "D4SCIENCE_OIDC_URL", "https://accounts.d4science.org/auth/realms/d4science/"
@@ -45,128 +27,14 @@ JUPYTERHUB_INFOSYS_URL = os.environ.get(
     "JUPYTERHUB_INFOSYS_URL",
     D4SCIENCE_REGISTRY_BASE_URL + "/GenericResource/JupyterHub",
 )
-
-
-class D4ScienceLoginHandler(BaseHandler):
-    # override implementation of clear_cookies from tornado to add extra
-    # options
-    def clear_cookie(self, name, path="/", domain=None):
-        kwargs = self.settings.get("cookie_options", {})
-        expires = datetime.datetime.utcnow() - datetime.timedelta(days=365)
-        self.set_cookie(
-            name, value="", path=path, expires=expires, domain=domain, **kwargs
-        )
-
-    async def get(self):
-        self.log.debug("Authenticating user")
-        user = await self.get_current_user()
-        token = self.get_argument("gcube-token")
-        if user and token:
-            self.log.debug("Clearing login cookie, new user?")
-            # clear login cookies with full set of options
-
-            self.clear_login_cookie()
-            # make sure we don't do a mess here
-            self.redirect(
-                url_concat(
-                    self.authenticator.login_url(self.hub.base_url),
-                    {"gcube-token": token},
-                ),
-                permanent=False,
-            )
-            return
-        if not token:
-            self.log.error("No gcube token. Out!")
-            raise web.HTTPError(403)
-        http_client = AsyncHTTPClient()
-        # discover user info
-        user_url = url_concat(
-            url_path_join(D4SCIENCE_SOCIAL_URL, D4SCIENCE_PROFILE),
-            {"gcube-token": token},
-        )
-        req = HTTPRequest(user_url, method="GET")
-        try:
-            resp = await http_client.fetch(req)
-        except HTTPError as e:
-            # whatever, get out
-            self.log.warning("Something happened with gcube service: %s", e)
-            raise web.HTTPError(403)
-        resp_json = json.loads(resp.body.decode("utf8", "replace"))
-        username = resp_json.get("result", {}).get("username", "")
-        context = resp_json.get("result", {}).get("context", "")
-
-        if not username or not context:
-            self.log.error("Unable to get the user or context from gcube?")
-            raise web.HTTPError(403)
-
-        # discover WPS if enabled
-        wps_endpoint = ""
-        if D4SCIENCE_DISCOVER_WPS.lower() in ["true", "1"]:
-            self.log.debug("Discover wps")
-            discovery_url = url_concat(
-                D4SCIENCE_DM_REGISTRY_URL, {"gcube-token": token}
-            )
-            req = HTTPRequest(discovery_url, method="GET")
-            try:
-                self.log.debug("fetch")
-                resp = await http_client.fetch(req)
-            except HTTPError as e:
-                # whatever, get out
-                self.log.error("Something happened with gcube service: %s", e)
-                raise web.HTTPError(403)
-            root = ElementTree.fromstring(resp.body.decode("utf8", "replace"))
-            self.log.debug("root %s", root)
-            for child in root.findall(
-                "Resource/Profile/AccessPoint/Interface/Endpoint"
-            ):
-                entry_name = child.attrib["EntryName"]
-                self.log.debug("entry_name %s", entry_name)
-                if entry_name != "GetCapabilities":
-                    wps_endpoint = child.text
-                    self.log.debug("WPS endpoint: %s", wps_endpoint)
-                    break
-        self.log.info("D4Science user is %s", username)
-        data = {
-            "gcube-token": token,
-            "gcube-user": username,
-            "wps-endpoint": wps_endpoint,
-            "context": context,
-        }
-        data.update(resp_json["result"])
-        user = await self.login_user(data)
-        if user:
-            self._jupyterhub_user = user
-            # we need to remove gcube-token from the url query to avoid
-            # the spawner not showing the the options form
-            # this code is basically taken from Stack Overflow
-            # https://stackoverflow.com/a/7734686
-            next_url = urlparse(self.get_next_url(user))
-            query = parse_qs(next_url.query, keep_blank_values=True)
-            query.pop("gcube-token", None)
-            next_url = next_url._replace(query=urlencode(query, True))
-            self.redirect(urlunparse(next_url), permanent=False)
-
-
-class D4ScienceAuthenticator(Authenticator):
-    login_handler = D4ScienceLoginHandler
-
-    async def authenticate(self, handler, data=None):
-        if data and data.get("gcube-user"):
-            return {"name": data["gcube-user"], "auth_state": data}
-        return None
-
-    async def pre_spawn_start(self, user, spawner):
-        """Pass gcube-token to spawner via environment variable"""
-        auth_state = await user.get_auth_state()
-        if not auth_state:
-            # auth_state not enabled
-            return
-        spawner.environment["GCUBE_TOKEN"] = auth_state["gcube-token"]
-        spawner.environment["DATAMINER_URL"] = auth_state["wps-endpoint"]
-        spawner.environment["GCUBE_CONTEXT"] = auth_state["context"]
-
-    def get_handlers(self, app):
-        return [(r"/login", self.login_handler)]
+DM_INFOSYS_URL = os.environ.get(
+    "DM_INFOSYS_URL",
+    D4SCIENCE_REGISTRY_BASE_URL + "/ServiceEndpoint/DataAnalysis/DataMiner",
+)
+D4SCIENCE_DISCOVER_WPS = os.environ.get(
+    "D4SCIENCE_DISCOVER_WPS",
+    "false",
+)
 
 
 class D4ScienceContextHandler(OAuthLoginHandler):
@@ -187,6 +55,12 @@ class D4ScienceOauthenticator(GenericOAuthenticator):
         JUPYTERHUB_INFOSYS_URL,
         config=True,
         help="""The URL for getting JupyterHub profiles from the
+                Information System of D4science""",
+    )
+    dm_infosys_url = Unicode(
+        DM_INFOSYS_URL,
+        config=True,
+        help="""The URL for getting DataMiner resources from the
                 Information System of D4science""",
     )
 
@@ -259,6 +133,38 @@ class D4ScienceOauthenticator(GenericOAuthenticator):
         self.log.debug("Decoded token: %s", decoded_token)
         return token, decoded_token
 
+    async def get_wps(self, access_token):
+        # discover WPS if enabled
+        wps_endpoint = {}
+        if D4SCIENCE_DISCOVER_WPS.lower() in ["true", "1"]:
+            http_client = AsyncHTTPClient()
+            req = HTTPRequest(
+                self.dm_infosys_url,
+                method="GET",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                },
+            )
+            try:
+                resp = await http_client.fetch(req)
+            except HTTPError as e:
+                self.log.warning("Unable to get the resources for user: %s", e)
+                self.log.debug(req)
+                # no need to fail here
+                return wps_endpoint
+            dm = xmltodict.parse(resp.body)
+            try:
+                for ap in dm["serviceEndpoints"]["Resource"]["Profile"]["AccessPoint"]:
+                    if ap["Interface"]["Endpoint"]["@EntryName"] == "Cluster":
+                        wps_endpoint = {
+                            "D4SCIENCE_WPS_URL": ap["Interface"]["Endpoint"]["#text"]
+                        }
+            except KeyError as e:
+                # unexpected xml, just keep going
+                self.log.warning("Unexpected XML: %s", e)
+                self.log.debug(dm)
+        return wps_endpoint
+
     async def get_resources(self, access_token):
         http_client = AsyncHTTPClient()
         req = HTTPRequest(
@@ -299,6 +205,10 @@ class D4ScienceOauthenticator(GenericOAuthenticator):
         ws_token, _ = await self.get_uma_token(context, context, access_token)
         permissions = decoded_token["authorization"]["permissions"]
         self.log.debug("Permissions: %s", permissions)
+        roles = (
+            decoded_token.get("resource_access", {}).get(context, {}).get("roles", [])
+        )
+        self.log.debug("Roles: %s", roles)
         resources = await self.get_resources(ws_token)
         self.log.debug("Resources: %s", resources)
         user_data["auth_state"].update(
@@ -307,19 +217,27 @@ class D4ScienceOauthenticator(GenericOAuthenticator):
                 "permissions": permissions,
                 "context": context,
                 "resources": resources,
+                "roles": roles,
             }
         )
+        # get WPS endpoint in also
+        user_data["auth_state"].update(await self.get_wps(ws_token))
         return user_data
 
     async def pre_spawn_start(self, user, spawner):
-        """Pass gcube-token to spawner via environment variable"""
+        """Pass relevant variables to spawner via environment variable"""
         auth_state = await user.get_auth_state()
         if not auth_state:
             # auth_state not enabled
             return
+        # GCUBE_TOKEN should be removed in the future
         spawner.environment["GCUBE_TOKEN"] = auth_state["context_token"]
-        # spawner.environment["DATAMINER_URL"] = auth_state["wps-endpoint"]
+        spawner.environment["D4SCIENCE_TOKEN"] = auth_state["context_token"]
+        # GCUBE_CONTEXT should be removed in the future
         spawner.environment["GCUBE_CONTEXT"] = unquote(auth_state["context"])
+        spawner.environment["D4SCIENCE_CONTEXT"] = unquote(auth_state["context"])
+        if "D4SCIENCE_WPS_URL" in auth_state:
+            spawner.environment["DATAMINER_URL"] = auth_state["D4SCIENCE_WPS_URL"]
 
 
 class D4ScienceSpawner(KubeSpawner):
@@ -355,6 +273,28 @@ class D4ScienceSpawner(KubeSpawner):
                 https://jupyterhub-kubespawner.readthedocs.io/en/latest/spawner.html#kubespawner.KubeSpawner.profile_list
             """,
     )
+    server_options_names = List(
+        ["ServerOption", "RStudioServerOption"],
+        config=True,
+        help="""Name of ServerOptions to consider from the D4Science Information
+                System. These can be then used for filtering with named servers""",
+    )
+    default_server_option_name = Unicode(
+        "ServerOption",
+        config=True,
+        help="""Name of default ServerOption (to be used
+                if no named server is spawned)""",
+    )
+    server_name_prefix = Unicode(
+        "rname-",
+        config=True,
+        help="""Prefix for naming the servers""",
+    )
+    data_manager_role = Unicode(
+        "Data-Manager",
+        config=True,
+        help="""Name of the data manager role in D4Science""",
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -388,6 +328,8 @@ class D4ScienceSpawner(KubeSpawner):
             return
         # just get from the authenticator
         permissions = auth_state.get("permissions", [])
+        roles = auth_state.get("roles", [])
+        self.log.debug("Roles at hook: %s", roles)
         self.allowed_profiles = [claim["rsname"] for claim in permissions]
         resources = auth_state.get("resources", {})
         self.server_options = {}
@@ -399,7 +341,14 @@ class D4ScienceSpawner(KubeSpawner):
             for opt in resource_list:
                 p = opt.get("Profile", {}).get("Body", {})
                 if p.get("ServerOption", None):
-                    self.server_options[p["ServerOption"]["AuthId"]] = p["ServerOption"]
+                    name = opt.get("Profile", {}).get("Name", "")
+                    if name in self.server_options_names:
+                        self.server_options[p["ServerOption"]["AuthId"]] = p[
+                            "ServerOption"
+                        ]
+                        self.server_options[p["ServerOption"]["AuthId"]].update(
+                            {"server_option_name": name}
+                        )
                 elif p.get("VolumeOption", None):
                     volume_options[p["VolumeOption"]["Name"]] = p["VolumeOption"][
                         "Permission"
@@ -415,11 +364,19 @@ class D4ScienceSpawner(KubeSpawner):
                 vol = {"name": (vol_name)}
                 vol.update(self.volume_mappings[name]["volume"])
                 self.volumes.append(vol)
+                read_write = (permission == "Read-Write") or (
+                    self.data_manager_role in roles
+                )
+                self.log.debug(
+                    "permission: %s, data-manager: %s",
+                    permission,
+                    self.data_manager_role in roles,
+                )
                 self.volume_mounts.append(
                     {
                         "name": vol_name,
                         "mountPath": self.volume_mappings[name]["mount_path"],
-                        "readOnly": permission == "Read-only",
+                        "readOnly": not read_write,
                     },
                 )
         self.log.debug("allowed: %s", self.allowed_profiles)
@@ -432,55 +389,71 @@ class D4ScienceSpawner(KubeSpawner):
     def profile_list(self, spawner):
         # returns the list of profiles built according to the permissions
         # and resource definition that the authenticator obtained initially
-        if not (self.allowed_profiles and self.server_options):
-            return []
-
         profiles = []
-        for allowed in self.allowed_profiles:
-            p = self.server_options.get(allowed, None)
-            if not p:
-                continue
-            override = {}
-            name = p.get("Info", {}).get("Name", "")
-            if "ImageId" in p:
-                override["image"] = p.get("ImageId", None)
-            if "Cut" in p:
-                cut_info = []
-                if "Cores" in p["Cut"]:
-                    override["cpu_limit"] = float(p["Cut"]["Cores"])
-                    cut_info.append(f"{p['Cut']['Cores']} Cores")
-                if "Memory" in p["Cut"]:
-                    override["mem_limit"] = "%(#text)s%(@unit)s" % p["Cut"]["Memory"]
-                    cut_info.append(f"{override['mem_limit']} RAM")
-                name += " - %s" % " / ".join(cut_info)
-            profile = {
-                "display_name": name,
-                "description": p.get("Info", {}).get("Description", ""),
-                "slug": p.get("AuthId", ""),
-                "kubespawner_override": override,
-                "default": p.get("@default", {}) == "true",
-            }
-            if profile["default"]:
-                profiles.insert(0, profile)
-            else:
-                profiles.append(profile)
+
+        # Requires python 3.9!
+        server_option_name = (
+            spawner.name.removeprefix(self.server_name_prefix)
+            if spawner.name
+            else self.default_server_option_name
+        )
+
+        if self.allowed_profiles and self.server_options:
+            for allowed in self.allowed_profiles:
+                p = self.server_options.get(allowed, None)
+                if not p:
+                    continue
+                override = {}
+                name = p.get("Info", {}).get("Name", "")
+                if p.get("server_option_name", "") != server_option_name:
+                    self.log.debug(
+                        "Discarding %s as it uses %s",
+                        name,
+                        p.get("server_option_name", ""),
+                    )
+                    continue
+                if "ImageId" in p:
+                    override["image"] = p.get("ImageId", None)
+                if "Cut" in p:
+                    cut_info = []
+                    if "Cores" in p["Cut"]:
+                        override["cpu_limit"] = float(p["Cut"]["Cores"])
+                        cut_info.append(f"{p['Cut']['Cores']} Cores")
+                    if "Memory" in p["Cut"]:
+                        override["mem_limit"] = (
+                            "%(#text)s%(@unit)s" % p["Cut"]["Memory"]
+                        )
+                        cut_info.append(f"{override['mem_limit']} RAM")
+                    name += " - %s" % " / ".join(cut_info)
+                profile = {
+                    "display_name": name,
+                    "description": p.get("Info", {}).get("Description", ""),
+                    "slug": p.get("AuthId", ""),
+                    "kubespawner_override": override,
+                    "default": p.get("@default", {}) == "true",
+                }
+                if profile["default"]:
+                    profiles.insert(0, profile)
+                else:
+                    profiles.append(profile)
         if self.extra_profiles:
             profiles.extend(self.extra_profiles)
         sorted_profiles = sorted(profiles, key=lambda x: x["display_name"])
+        self.log.debug("Profiles: %s", sorted_profiles)
         return sorted_profiles
 
     async def pre_spawn_hook(self, spawner):
         # add volumes as defined in the D4Science info sys
-        gcube_token = spawner.environment.get("GCUBE_TOKEN", "")
-        context = spawner.environment.get("GCUBE_CONTEXT", "")
+        token = spawner.environment.get("D4SCIENCE_TOKEN", "")
+        context = spawner.environment.get("D4SCIENCE_CONTEXT", "")
         if context:
             # set the whole context as annotation (needed for accounting)
             spawner.extra_annotations["d4science_context"] = context
             # set only the VRE name in the environment (needed for NFS subpath)
             vre = context[context.rindex("/") + 1 :]
-            spawner.log.info("VRE: %s", vre)
+            spawner.log.debug("VRE: %s", vre)
             spawner.environment["VRE"] = vre
-        if gcube_token:
+        if token:
             spawner.extra_containers = [
                 {
                     "name": "workspace-sidecar",
@@ -492,7 +465,7 @@ class D4ScienceSpawner(KubeSpawner):
                     },
                     "env": [
                         {"name": "MNTPATH", "value": "/workspace"},
-                        {"name": "GCUBE_TOKEN", "value": gcube_token},
+                        {"name": "D4SCIENCE_TOKEN", "value": token},
                     ],
                     "volumeMounts": [
                         {"mountPath": "/workspace:shared", "name": "workspace"},
