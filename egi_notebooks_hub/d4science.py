@@ -14,7 +14,7 @@ from oauthenticator.generic import GenericOAuthenticator
 from oauthenticator.oauth2 import OAuthLoginHandler
 from tornado import web
 from tornado.httpclient import AsyncHTTPClient, HTTPError, HTTPRequest
-from traitlets import Dict, List, Unicode
+from traitlets import Bool, Dict, List, Unicode
 
 D4SCIENCE_REGISTRY_BASE_URL = os.environ.get(
     "D4SCIENCE_REGISTRY_BASE_URL",
@@ -38,14 +38,23 @@ D4SCIENCE_DISCOVER_WPS = os.environ.get(
 
 
 class D4ScienceContextHandler(OAuthLoginHandler):
-    def get_state(self):
+    def get(self):
         context = self.get_argument("context", None)
+        namespace = self.get_argument("namespace", None)
+        label = self.get_argument("label", None)
         self.authenticator.d4science_context = context
-        return super().get_state()
+        self.authenticator.d4science_namespace = namespace
+        self.authenticator.d4science_label = label
+        return super().get()
 
 
 class D4ScienceOauthenticator(GenericOAuthenticator):
     login_handler = D4ScienceContextHandler
+    # some options that will come from the context handler
+    d4science_context = None
+    d4science_namespace = None
+    d4science_label = None
+
     d4science_oidc_url = Unicode(
         D4SCIENCE_OIDC_URL,
         config=True,
@@ -62,6 +71,13 @@ class D4ScienceOauthenticator(GenericOAuthenticator):
         config=True,
         help="""The URL for getting DataMiner resources from the
                 Information System of D4science""",
+    )
+    d4science_label_name = Unicode(
+        "d4science-namespace",
+        config=True,
+        help="""The name of the label to use when setting extra labels
+                coming from the authentication (i.e. label="blue-cloud"
+                as param)""",
     )
 
     _pubkeys = None
@@ -185,14 +201,21 @@ class D4ScienceOauthenticator(GenericOAuthenticator):
         # Assume that this will fly
         return xmltodict.parse(resp.body)
 
+    def _get_d4science_attr(self, attr_name):
+        v = getattr(self, attr_name, None)
+        if v:
+            return quote_plus(v)
+        return None
+
     async def authenticate(self, handler, data=None):
         # first get authorized upstream
         user_data = await super().authenticate(handler, data)
-        context = quote_plus(getattr(self, "d4science_context", None))
+        context = self._get_d4science_attr("d4science_context")
         self.log.debug("Context is %s", context)
         if not context:
             self.log.error("Unable to get the user context")
             raise web.HTTPError(403)
+        context = quote_plus(context)
         access_token = user_data["auth_state"]["access_token"]
         extra_params = {
             "claim_token": base64.b64encode(
@@ -202,11 +225,15 @@ class D4ScienceOauthenticator(GenericOAuthenticator):
         token, decoded_token = await self.get_uma_token(
             context, self.client_id, access_token, extra_params
         )
-        ws_token, _ = await self.get_uma_token(context, context, access_token)
+        ws_token, decoded_ws_token = await self.get_uma_token(
+            context, context, access_token
+        )
         permissions = decoded_token["authorization"]["permissions"]
         self.log.debug("Permissions: %s", permissions)
         roles = (
-            decoded_token.get("resource_access", {}).get(context, {}).get("roles", [])
+            decoded_ws_token.get("resource_access", {})
+            .get(context, {})
+            .get("roles", [])
         )
         self.log.debug("Roles: %s", roles)
         resources = await self.get_resources(ws_token)
@@ -216,6 +243,8 @@ class D4ScienceOauthenticator(GenericOAuthenticator):
                 "context_token": ws_token,
                 "permissions": permissions,
                 "context": context,
+                "namespace": self._get_d4science_attr("d4science_namespace"),
+                "label": self._get_d4science_attr("d4science_label"),
                 "resources": resources,
                 "roles": roles,
             }
@@ -230,6 +259,12 @@ class D4ScienceOauthenticator(GenericOAuthenticator):
         if not auth_state:
             # auth_state not enabled
             return
+        namespace = auth_state.get("namespace", None)
+        if namespace:
+            spawner.namespace = namespace
+        label = auth_state.get("label", None)
+        if label:
+            spawner.extra_labels[self.d4science_label_name] = label
         # GCUBE_TOKEN should be removed in the future
         spawner.environment["GCUBE_TOKEN"] = auth_state["context_token"]
         spawner.environment["D4SCIENCE_TOKEN"] = auth_state["context_token"]
@@ -245,6 +280,40 @@ class D4ScienceSpawner(KubeSpawner):
         "https://*.d4science.org 'self'",
         config=True,
         help="""Frame ancestors for embedding the hub in d4science""",
+    )
+    use_ophidia = Bool(
+        True,
+        config=True,
+        help="""Whether to enable or not the ophidia setup""",
+    )
+    ophidia_image = Unicode(
+        "ophidiabigdata/ophidia-backend-hub:v1.1",
+        config=True,
+        help="""Ophidia image""",
+    )
+    ophidia_user = Unicode(
+        "oph-test",
+        config=True,
+        help="""Ophidia user""",
+    )
+    ophidia_passwd = Unicode(
+        "abcd",
+        config=True,
+        help="""Ophidia password""",
+    )
+    workspace_security_context = Dict(
+        {
+            "capabilities": {"add": ["SYS_ADMIN"]},
+            "privileged": True,
+            "runAsUser": 1000,
+        },
+        config=True,
+        help="""Container security context for mounting the workspace""",
+    )
+    use_sidecar = Bool(
+        True,
+        config=True,
+        help="""Whether to use or not a sidecar for the workspace""",
     )
     sidecar_image = Unicode(
         "eginotebooks/d4science-storage",
@@ -295,6 +364,16 @@ class D4ScienceSpawner(KubeSpawner):
         config=True,
         help="""Name of the data manager role in D4Science""",
     )
+    context_namespaces = Bool(
+        False,
+        config=True,
+        help="""Whether context-specific namespaces will be used or not""",
+    )
+    image_repo_override = Unicode(
+        "",
+        config=True,
+        help="""If provided, override image repository with this value""",
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -302,18 +381,19 @@ class D4ScienceSpawner(KubeSpawner):
         self.server_options = []
         self._orig_volumes = self.volumes
         self._orig_volume_mounts = self.volume_mounts
+        if self.image_repo_override:
+            # pylint: disable-next=access-member-before-definition
+            image = self.image.rsplit("/", 1)[-1]
+            self.image = f"{self.image_repo_override}/{image}"
+
+    async def _ensure_namespace(self):
+        if not self.context_namespaces:
+            super()._ensure_namespace()
 
     def get_args(self):
         args = super().get_args()
-        tornado_settings = {
-            "headers": {
-                "Content-Security-Policy": "frame-ancestors %s" % self.frame_ancestors
-            },
-            "cookie_options": {"samesite": "None", "secure": True},
-        }
         # TODO: check if this keeps making sense
         return [
-            "--SingleUserNotebookApp.tornado_settings=%s" % tornado_settings,
             "--FileCheckpoints.checkpoint_dir='/home/jovyan/.notebookCheckpoints'",
             "--FileContentsManager.use_atomic_writing=False",
             "--ResourceUseDisplay.track_cpu_percent=True",
@@ -413,11 +493,18 @@ class D4ScienceSpawner(KubeSpawner):
                     )
                     continue
                 if "ImageId" in p:
-                    override["image"] = p.get("ImageId", None)
+                    image = p.get("ImageId", "")
+                    if self.image_repo_override:
+                        image = image.rsplit("/", 1)[-1]
+                        image = f"{self.image_repo_override}/{image}"
+                    override["image"] = image
                 if "Cut" in p:
                     cut_info = []
                     if "Cores" in p["Cut"]:
                         override["cpu_limit"] = float(p["Cut"]["Cores"])
+                        override["cpu_guarantee"] = (
+                            1 if override["cpu_limit"] <= 4 else 2
+                        )
                         cut_info.append(f"{p['Cut']['Cores']} Cores")
                     if "Memory" in p["Cut"]:
                         override["mem_limit"] = (
@@ -442,9 +529,53 @@ class D4ScienceSpawner(KubeSpawner):
         self.log.debug("Profiles: %s", sorted_profiles)
         return sorted_profiles
 
-    async def pre_spawn_hook(self, spawner):
-        # add volumes as defined in the D4Science info sys
+    def _configure_ophidia(self, spawner):
+        if not self.use_ophidia:
+            return
+        chosen_profile = spawner.user_options.get("profile", "")
+        if "ophidia" in chosen_profile:
+            ophidia_mounts = [
+                m for m in spawner.volume_mounts if m["name"] != "workspace"
+            ]
+            ophidia = {
+                "name": "ophidia",
+                "image": self.ophidia_image,
+                "volumeMounts": ophidia_mounts,
+            }
+            spawner.extra_containers.append(ophidia)
+            spawner.environment["OPH_USER"] = self.ophidia_user
+            spawner.environment["OPH_PASSWD"] = self.ophidia_passwd
+            spawner.environment["OPH_SERVER_HOST"] = "127.0.0.1"
+            spawner.environment["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
+    def _configure_workspace(self, spawner):
         token = spawner.environment.get("D4SCIENCE_TOKEN", "")
+        if not token:
+            self.log.debug("Not configuring workspace access, there is no token")
+            return
+        if self.use_sidecar:
+            sidecar = {
+                "name": "workspace-sidecar",
+                "image": self.sidecar_image,
+                "securityContext": self.workspace_security_context,
+                "env": [
+                    {"name": "MNTPATH", "value": "/workspace"},
+                    {"name": "D4SCIENCE_TOKEN", "value": token},
+                ],
+                "volumeMounts": [
+                    {"mountPath": "/workspace:shared", "name": "workspace"},
+                ],
+                "lifecycle": {
+                    "preStop": {
+                        "exec": {"command": ["fusermount", "-uz", "/workspace"]}
+                    },
+                },
+            }
+            spawner.extra_containers.append(sidecar)
+        else:
+            spawner.container_security_context = self.workspace_security_context
+
+    async def pre_spawn_hook(self, spawner):
         context = spawner.environment.get("D4SCIENCE_CONTEXT", "")
         if context:
             # set the whole context as annotation (needed for accounting)
@@ -453,27 +584,7 @@ class D4ScienceSpawner(KubeSpawner):
             vre = context[context.rindex("/") + 1 :]
             spawner.log.debug("VRE: %s", vre)
             spawner.environment["VRE"] = vre
-        if token:
-            spawner.extra_containers = [
-                {
-                    "name": "workspace-sidecar",
-                    "image": self.sidecar_image,
-                    "securityContext": {
-                        "privileged": True,
-                        "capabilities": {"add": ["SYS_ADMIN"]},
-                        "runAsUser": 1000,
-                    },
-                    "env": [
-                        {"name": "MNTPATH", "value": "/workspace"},
-                        {"name": "D4SCIENCE_TOKEN", "value": token},
-                    ],
-                    "volumeMounts": [
-                        {"mountPath": "/workspace:shared", "name": "workspace"},
-                    ],
-                    "lifecycle": {
-                        "preStop": {
-                            "exec": {"command": ["fusermount", "-uz", "/workspace"]}
-                        },
-                    },
-                }
-            ]
+        # TODO(enolfc): check whether assigning to [] is safe
+        spawner.extra_containers = []
+        self._configure_workspace(spawner)
+        self._configure_ophidia(spawner)
